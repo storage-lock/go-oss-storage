@@ -28,6 +28,9 @@ type OSSConnectionManager struct {
 var _ storage.ConnectionManager[*oss.Bucket] = &OSSConnectionManager{}
 
 // NewOSSConnectionManagerFromEndpoint 从端点参数创建连接管理器
+// ossNew 默认创建真实客户端，测试可替换。
+var ossNew = oss.New
+
 func NewOSSConnectionManagerFromEndpoint(endpoint, accessKeyID, accessKeySecret, bucketName string) *OSSConnectionManager {
 	return &OSSConnectionManager{
 		Endpoint:        endpoint,
@@ -40,11 +43,11 @@ func NewOSSConnectionManagerFromEndpoint(endpoint, accessKeyID, accessKeySecret,
 // NewOSSConnectionManagerFromClient 从已有客户端创建连接管理器
 func NewOSSConnectionManagerFromClient(client *oss.Client, bucket *oss.Bucket) *OSSConnectionManager {
 	return &OSSConnectionManager{
-		presetClient:   client,
-		presetBucket:   bucket,
-		initialized:    true,
-		client:         client,
-		bucket:         bucket,
+		presetClient: client,
+		presetBucket: bucket,
+		initialized:  true,
+		client:       client,
+		bucket:       bucket,
 	}
 }
 
@@ -60,7 +63,7 @@ func (x *OSSConnectionManager) Take(ctx context.Context) (*oss.Bucket, error) {
 		return x.bucket, nil
 	}
 
-	client, err := oss.New(x.Endpoint, x.AccessKeyID, x.AccessKeySecret)
+	client, err := ossNew(x.Endpoint, x.AccessKeyID, x.AccessKeySecret)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create OSS client: %w", err)
 	}

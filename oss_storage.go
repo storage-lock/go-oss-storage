@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -17,12 +18,31 @@ import (
 
 const valueSeparator = "\x00"
 
+// 对象操作默认走真实 Bucket。SDK 方法是值接收者，无法用嵌入类型覆盖，测试通过替换这些函数覆盖分支。
+var (
+	ossPutObject = func(bucket *oss.Bucket, key string, reader io.Reader, options ...oss.Option) error {
+		return bucket.PutObject(key, reader, options...)
+	}
+	ossGetObject = func(bucket *oss.Bucket, key string) (io.ReadCloser, error) {
+		return bucket.GetObject(key)
+	}
+	ossGetObjectDetailedMeta = func(bucket *oss.Bucket, key string) (http.Header, error) {
+		return bucket.GetObjectDetailedMeta(key)
+	}
+	ossDeleteObject = func(bucket *oss.Bucket, key string) error {
+		return bucket.DeleteObject(key)
+	}
+	ossListObjects = func(bucket *oss.Bucket, options ...oss.Option) (oss.ListObjectsResult, error) {
+		return bucket.ListObjects(options...)
+	}
+)
+
 // OSSStorage 基于 OSS 的存储引擎实现
 // OSS 支持条件 PUT，但不支持原子条件删除，释放走墓碑降级路径
 type OSSStorage struct {
-	options       *OSSStorageOptions
-	bucket        *oss.Bucket
-	timeProvider  storage.TimeProvider
+	options      *OSSStorageOptions
+	bucket       *oss.Bucket
+	timeProvider storage.TimeProvider
 }
 
 var _ storage.Storage = &OSSStorage{}
@@ -48,7 +68,12 @@ func (x *OSSStorage) Capabilities() []storage.StorageCapability {
 	return []storage.StorageCapability{
 		storage.CapabilityCAS,
 		storage.CapabilityReliableTime,
+		storage.CapabilityWatch,
 	}
+}
+
+func (x *OSSStorage) Watch(ctx context.Context, lockId string) (<-chan *storage.LockInformation, error) {
+	return storage.NewPollingLockWatcher(x, 500*time.Millisecond).Watch(ctx, lockId)
 }
 
 func (x *OSSStorage) Init(ctx context.Context) error {
@@ -101,7 +126,7 @@ func (x *OSSStorage) CreateWithVersion(ctx context.Context, lockId string, versi
 	options := []oss.Option{
 		oss.ForbidOverWrite(true),
 	}
-	err := x.bucket.PutObject(key, bytes.NewReader(value), options...)
+	err := ossPutObject(x.bucket, key, bytes.NewReader(value), options...)
 	if err != nil {
 		if isPreconditionError(err) {
 			return storage_lock.ErrVersionMiss
@@ -117,20 +142,21 @@ func (x *OSSStorage) UpdateWithVersion(ctx context.Context, lockId string, expec
 	key := x.objectKey(lockId)
 
 	// 先获取对象元数据（包含 ETag）
-	meta, err := x.bucket.GetObjectDetailedMeta(key)
+	meta, err := ossGetObjectDetailedMeta(x.bucket, key)
 	if err != nil {
 		if isNotFoundError(err) {
-			return storage_lock.ErrLockNotFound
+			// 记录不存在返回 ErrVersionMiss（可重试），对齐 S3 基类/memory 已修口径。
+			return storage_lock.ErrVersionMiss
 		}
 		return err
 	}
 	etag := meta.Get("ETag")
 
 	// 再获取对象内容
-	result, err := x.bucket.GetObject(key)
+	result, err := ossGetObject(x.bucket, key)
 	if err != nil {
 		if isNotFoundError(err) {
-			return storage_lock.ErrLockNotFound
+			return storage_lock.ErrVersionMiss
 		}
 		return err
 	}
@@ -154,7 +180,7 @@ func (x *OSSStorage) UpdateWithVersion(ctx context.Context, lockId string, expec
 	options := []oss.Option{
 		oss.IfMatch(etag),
 	}
-	err = x.bucket.PutObject(key, bytes.NewReader(newValue), options...)
+	err = ossPutObject(x.bucket, key, bytes.NewReader(newValue), options...)
 	if err != nil {
 		if isPreconditionError(err) {
 			return storage_lock.ErrVersionMiss
@@ -168,7 +194,7 @@ func (x *OSSStorage) UpdateWithVersion(ctx context.Context, lockId string, expec
 func (x *OSSStorage) DeleteWithVersion(ctx context.Context, lockId string, expectedVersion storage.Version, lockInformation *storage.LockInformation) error {
 	key := x.objectKey(lockId)
 
-	result, err := x.bucket.GetObject(key)
+	result, err := ossGetObject(x.bucket, key)
 	if err != nil {
 		if isNotFoundError(err) {
 			return storage_lock.ErrLockNotFound
@@ -189,12 +215,12 @@ func (x *OSSStorage) DeleteWithVersion(ctx context.Context, lockId string, expec
 		return storage_lock.ErrVersionMiss
 	}
 
-	return x.bucket.DeleteObject(key)
+	return ossDeleteObject(x.bucket, key)
 }
 
 func (x *OSSStorage) Get(ctx context.Context, lockId string) (string, error) {
 	key := x.objectKey(lockId)
-	result, err := x.bucket.GetObject(key)
+	result, err := ossGetObject(x.bucket, key)
 	if err != nil {
 		if isNotFoundError(err) {
 			return "", storage_lock.ErrLockNotFound
@@ -231,13 +257,13 @@ func (x *OSSStorage) List(ctx context.Context) (go_iterator.Iterator[*storage.Lo
 
 	marker := ""
 	for {
-		lsRes, err := x.bucket.ListObjects(oss.Prefix(prefix), oss.Marker(marker), oss.MaxKeys(1000))
+		lsRes, err := ossListObjects(x.bucket, oss.Prefix(prefix), oss.Marker(marker), oss.MaxKeys(1000))
 		if err != nil {
 			return nil, err
 		}
 
 		for _, object := range lsRes.Objects {
-			result, err := x.bucket.GetObject(object.Key)
+			result, err := ossGetObject(x.bucket, object.Key)
 			if err != nil {
 				continue
 			}
